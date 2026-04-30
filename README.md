@@ -1,66 +1,89 @@
 # Simple Chatbot
 
-A lightweight local chatbot built with FastAPI, Ollama, and a custom HTML/CSS/JS chat UI.
+A FastAPI-based chatbot with a custom HTML/CSS/JS UI, powered by Hugging Face Router (OpenAI-compatible API). It supports session memory and optional database tool-calling.
 
 ## Features
 
-- FastAPI backend with `/chat` endpoint
-- Browser chat UI served at `/`
-- Local LLM inference via Ollama (OpenAI-compatible API)
-- Session-based in-memory conversation history
-- Configurable logging with optional colors
+- Web chat UI at `/`
+- REST API endpoint at `/chat`
+- Hugging Face Router integration via OpenAI SDK
+- Per-session in-memory conversation history
+- Optional tool-calling for PostgreSQL queries
+- Structured, color-capable logging
 
 ## Tech Stack
 
 - Python 3.12+
 - FastAPI + Uvicorn
-- Ollama (local model runtime)
-- OpenAI Python SDK (pointing to Ollama base URL)
+- OpenAI Python SDK (`base_url=https://router.huggingface.co/v1`)
+- PostgreSQL (`psycopg2`) for tool-backed DB queries
+- Vanilla HTML/CSS/JavaScript frontend
 
 ## Project Structure
 
 ```text
 simple_chatbot/
-├─ main.py                 # FastAPI app + routes
-├─ service/
-│  └─ llm.py               # LLM client + chat session logic
+├─ main.py                     # FastAPI app + routes
 ├─ core/
-│  └─ logger.py            # Central logger config
+│  └─ logger.py                # Central logger config
+├─ service/
+│  ├─ llm.py                   # HF Router chat + tool flow
+│  ├─ tools.py                 # Tool wrappers
+│  └─ db.py                    # PostgreSQL query execution
 ├─ static/
-│  ├─ index.html           # Chat UI
-│  ├─ styles.css           # UI styles
-│  └─ app.js               # UI interactions
+│  ├─ index.html               # Chat UI
+│  ├─ styles.css               # UI styles
+│  └─ app.js                   # UI behavior
+├─ .env-example
 ├─ pyproject.toml
 └─ README.md
 ```
 
 ## Prerequisites
 
-1. Install and run Ollama
-2. Pull at least one model (example):
+1. Python `3.12+`
+2. A Hugging Face token with inference access
+3. PostgreSQL running locally (for tool-calling), default expected:
+   - host: `localhost`
+   - port: `5432`
+   - db: `csv_db`
+   - user: `csv_user`
+   - password: `csv_pass`
+
+## Setup
 
 ```bash
-ollama pull tinyllama:latest
+cd /Users/vaibhavpandey/Documents/projects/simple_chatbot
+cp .env-example .env
 ```
 
-3. Make sure Ollama is reachable at `http://localhost:11434`
+Edit `.env` and set at least:
 
-## Run Locally
+```env
+HF_MODEL=openai/gpt-oss-20b:groq
+HF_TOKEN=hf_your_real_token_here
+```
+
+Install dependencies:
 
 ```bash
-cd /Users/username/Documents/projects/simple_chatbot
 uv sync
+```
+
+## Run
+
+```bash
 uv run uvicorn main:app --reload
 ```
 
-Open:
+Open in browser:
 
 - UI: `http://127.0.0.1:8000`
 - Health: `http://127.0.0.1:8000/health`
 
 ## API Usage
 
-### Health Check
+### Health
 
 ```bash
 curl http://127.0.0.1:8000/health
@@ -73,29 +96,41 @@ curl -X POST "http://127.0.0.1:8000/chat" \
   -H "Content-Type: application/json" \
   -d '{
     "session_id": "demo-session-1",
-    "user_input": "Hello, how are you?"
+    "user_input": "Show top 5 customers by order count"
   }'
 ```
 
 ## Environment Variables
 
-Set in `.env` (or export in shell):
+### LLM
 
-- `OLLAMA_MODEL` (default: `tinyllama:latest`)
-- `LOG_LEVEL` (default: `INFO`)
-- `LOGGER` (`true`/`false`) to enable/disable logs
-- `LOGGER_COLOR` (`true`/`false`) for colored logs
+- `HF_MODEL` default: `openai/gpt-oss-20b:groq`
+- `HF_TOKEN` required
+- `HF_TEMPERATURE` default: `0.2`
+- `HF_TOP_P` default: `0.9`
+- `MAX_HISTORY_MESSAGES` default: `16`
+- `ENABLE_TOOLS` default: `true`
 
-Example:
+### Logging
 
-```env
-OLLAMA_MODEL=tinyllama:latest
-LOG_LEVEL=INFO
-LOGGER=true
-LOGGER_COLOR=true
-```
+- `LOG_LEVEL` default: `INFO`
+- `LOGGER` default: `true`
+- `LOGGER_COLOR` default: `true`
 
-## Notes
+## Tool-Calling Notes
 
-- Chat history is stored in memory and resets when server restarts.
-- If a model fails due to memory limits, switch to a smaller model (like `tinyllama:latest`).
+- Current tool: `get_data_from_db(query: str)`
+- Intended for safe `SELECT` queries
+- Tool output is JSON-serialized with datetime-safe conversion
+- If model/provider does not support tools, app retries without tools
+
+## Troubleshooting
+
+- `HF_TOKEN is missing`: set token in `.env` and restart server.
+- `does not support tools`: set `ENABLE_TOOLS=false` or use a tool-capable model/provider route.
+- DB errors: verify PostgreSQL credentials in `service/db.py` and ensure database is running.
+
+## Security
+
+- Never commit real `HF_TOKEN` to git.
+- If token is exposed, rotate it immediately in Hugging Face settings.
