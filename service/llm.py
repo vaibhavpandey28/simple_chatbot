@@ -12,11 +12,19 @@ client = OpenAI(
 chat_sessions ={}
 MODEL_NAME = os.getenv("OLLAMA_MODEL", "tinyllama:latest")
 
+DEFAULT_SYSTEM_PROMPT = """
+You are Vaibhav's personal AI assistant.
+- Be concise and practical
+- Prefer code examples when relevant
+- Assume user is a developer learning LLMs
+- Avoid unnecessary explanations
+"""
+
 def get_response(session_id: str, user_input: str):
     if session_id not in chat_sessions:
         logger.info("Creating new session: %s", session_id)
         chat_sessions[session_id] = [
-            {"role": "system", "content": "You are a helpful assistant."}
+            {"role": "system", "content": DEFAULT_SYSTEM_PROMPT}
         ]
 
     messages = chat_sessions[session_id]
