@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Simple Chatbot</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div class="title-wrap">
+          <h1>Simple Chatbot</h1>
+          <p>FastAPI + Ollama local assistant</p>
+        </div>
+        <div class="top-actions">
+          <span id="status-badge" class="status-badge">Ready</span>
+          <button id="clear-btn" class="ghost-btn" type="button">Clear</button>
+        </div>
+      </header>
+
+      <section class="prompt-row" id="prompt-row">
+        <button class="prompt-chip" type="button">Summarize today in 3 bullets</button>
+        <button class="prompt-chip" type="button">Draft a polite email reply</button>
+        <button class="prompt-chip" type="button">Give SQL to find top customers</button>
+      </section>
+
+      <section id="chat" class="chat" aria-live="polite"></section>
+
+      <form id="chat-form" class="composer">
+        <textarea id="message" rows="1" placeholder="Ask anything... (Enter to send, Shift+Enter for new line)" autocomplete="off" required></textarea>
+        <button id="send-btn" type="submit">Send</button>
+      </form>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
