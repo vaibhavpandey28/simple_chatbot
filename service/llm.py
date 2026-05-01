@@ -42,13 +42,13 @@ You are Vaibhav's personal AI assistant.
 """
 
 
-# OpenAI-compatible client for Hugging Face Router.
+# API client (Hugging Face Router speaks OpenAI-compatible format).
 client = OpenAI(
     base_url="https://router.huggingface.co/v1",
     api_key=HF_TOKEN or None,
 )
 
-# In-memory per-session history.
+# Stores chat history in memory: {session_id: [messages...]}
 chat_sessions: dict[str, list[dict[str, str]]] = {}
 
 
@@ -107,10 +107,10 @@ TOOLS = [
 
 
 def _trim_history(messages: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Keep system prompt + latest conversation turns."""
+    """Keep only recent messages so history does not grow forever."""
     if len(messages) <= MAX_HISTORY_MESSAGES:
         return messages
-    logger.debug(
+    logger.info(
         "Trimming history from %s to %s messages",
         len(messages),
         MAX_HISTORY_MESSAGES,
@@ -119,7 +119,7 @@ def _trim_history(messages: list[dict[str, str]]) -> list[dict[str, str]]:
 
 
 def _completion(messages: list[dict[str, str]], use_tools: bool):
-    """Call LLM once. Optionally attach tool definitions."""
+    """Send one request to the model, with tools if enabled."""
     kwargs = {
         "model": MODEL_NAME,
         "messages": messages,
@@ -132,7 +132,7 @@ def _completion(messages: list[dict[str, str]], use_tools: bool):
 
 
 def _get_or_create_session(session_id: str) -> list[dict[str, str]]:
-    """Initialize session with system prompt if missing."""
+    """Create a new session with system prompt, or return existing one."""
     if session_id not in chat_sessions:
         logger.info("Creating new session: %s", session_id)
         chat_sessions[session_id] = [{"role": "system", "content": DEFAULT_SYSTEM_PROMPT}]
@@ -140,7 +140,7 @@ def _get_or_create_session(session_id: str) -> list[dict[str, str]]:
 
 
 def _parse_tool_args(raw_args: str) -> dict[str, Any]:
-    """Parse tool-call JSON args safely."""
+    """Parse tool-call arguments from JSON; return empty dict if invalid."""
     try:
         return json.loads(raw_args or "{}")
     except json.JSONDecodeError:
@@ -149,12 +149,12 @@ def _parse_tool_args(raw_args: str) -> dict[str, Any]:
 
 
 def _escape_sql_text(value: str) -> str:
-    """Basic SQL escaping for single-quoted literals."""
+    """Escape single quotes for SQL string literals."""
     return value.replace("'", "''")
 
 
 def _fallback_category_hints() -> list[str]:
-    """Return top product categories to guide rephrased searches."""
+    """Get common categories to help users rephrase failed searches."""
     rows = get_data_from_db(
         """
         SELECT category, COUNT(*) AS total
@@ -171,7 +171,7 @@ def _fallback_category_hints() -> list[str]:
 
 
 def _fallback_shirt_examples(user_query: str, limit: int = 5) -> list[dict[str, Any]]:
-    """Try lexical matching against shirts when semantic match is empty."""
+    """If semantic search is empty, try a simple text match for shirts."""
     query = _escape_sql_text(user_query)
     rows = get_data_from_db(
         f"""
@@ -197,7 +197,7 @@ def _fallback_shirt_examples(user_query: str, limit: int = 5) -> list[dict[str, 
 
 
 def _execute_tool(function_name: str, args: dict[str, Any]) -> dict[str, Any]:
-    """Execute supported tool and return serializable response."""
+    """Run one supported tool and return JSON-safe output."""
     if function_name == "get_data_from_db":
         query = args.get("query")
         if not query:
@@ -231,7 +231,7 @@ def _execute_tool(function_name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 def _try_execute_text_tool_call(raw_text: str) -> dict[str, Any] | None:
     """
-    Some models return a JSON tool-call in plain text instead of tool_calls.
+    Some models return a JSON tool-call in plain text instead of `tool_calls`.
     Example: {"function":"semantic_search_products","arguments":{...}}
     """
     text = (raw_text or "").strip()
@@ -252,14 +252,14 @@ def _try_execute_text_tool_call(raw_text: str) -> dict[str, Any] | None:
 
 
 def get_response(session_id: str, user_input: str) -> str:
-    """Main chat flow: user message -> LLM -> optional tool -> final assistant reply."""
+    """Main flow: user message -> model -> optional tool -> final reply."""
     if not HF_TOKEN:
         logger.error("HF_TOKEN is missing; cannot call Hugging Face Router.")
         return "HF_TOKEN is missing. Add it in .env and restart the server."
 
     messages = _get_or_create_session(session_id)
     messages.append({"role": "user", "content": user_input})
-    logger.debug("User message appended. session_id=%s total_messages=%s", session_id, len(messages))
+    logger.info("User message appended. session_id=%s total_messages=%s", session_id, len(messages))
 
     try:
         logger.info("Calling model=%s tools_enabled=%s", MODEL_NAME, ENABLE_TOOLS)
@@ -279,7 +279,7 @@ def get_response(session_id: str, user_input: str) -> str:
     msg = response.choices[0].message
 
     if ENABLE_TOOLS and getattr(msg, "tool_calls", None):
-        # Handle only first tool-call for simplicity.
+        # Keep this simple: handle only the first tool call.
         tool_call = msg.tool_calls[0]
         function_name = tool_call.function.name
         args = _parse_tool_args(tool_call.function.arguments or "{}")
@@ -318,8 +318,8 @@ def get_response(session_id: str, user_input: str) -> str:
 
     reply = (msg.content or "").strip()
 
-    # Fallback: if a provider returned tool-call JSON as plain assistant text,
-    # execute it and ask the model to format a final user-facing response.
+    # Fallback: if provider returned tool-call JSON as plain text,
+    # run it and ask model for a normal user-facing answer.
     text_tool_result = _try_execute_text_tool_call(reply)
     if ENABLE_TOOLS and text_tool_result is not None:
         messages.append({"role": "assistant", "content": reply})
