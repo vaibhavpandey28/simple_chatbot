@@ -6,7 +6,11 @@ from dotenv import load_dotenv
 from openai import BadRequestError, OpenAI
 
 from core.logger import get_logger
-from service.tools import get_data_from_db
+from service.tools import (
+    get_data_from_db,
+    reindex_products_semantic,
+    semantic_search_products,
+)
 
 load_dotenv()
 logger = get_logger(__name__)
@@ -32,6 +36,9 @@ You are Vaibhav's personal AI assistant.
 - Stay on-topic and answer only what the user asked.
 - Do not invent names, stories, or context.
 - If unsure, say so briefly and ask for clarification.
+- For product recommendations, prefer semantic_search_products tool before raw SQL.
+- If semantic search returns no matches, provide concrete fallback help:
+  include likely categories from the database and suggest 2-3 specific rephrases.
 """
 
 
@@ -49,8 +56,41 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "semantic_search_products",
+            "description": "Semantic search over products using meaning-based matching. Use this first for product discovery queries.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language product intent, e.g. aesthetic shirt for summer.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of product matches to return.",
+                        "default": 5,
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reindex_products_semantic",
+            "description": "Rebuild the semantic index from current PostgreSQL products table.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_data_from_db",
-            "description": "Execute a SELECT SQL query on the PostgreSQL ecommerce database.",
+            "description": "Execute a SELECT SQL query on the PostgreSQL ecommerce database. Use when exact SQL-style data is requested.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -108,18 +148,107 @@ def _parse_tool_args(raw_args: str) -> dict[str, Any]:
         return {}
 
 
+def _escape_sql_text(value: str) -> str:
+    """Basic SQL escaping for single-quoted literals."""
+    return value.replace("'", "''")
+
+
+def _fallback_category_hints() -> list[str]:
+    """Return top product categories to guide rephrased searches."""
+    rows = get_data_from_db(
+        """
+        SELECT category, COUNT(*) AS total
+        FROM products
+        WHERE category IS NOT NULL AND category <> ''
+        GROUP BY category
+        ORDER BY total DESC, category ASC
+        LIMIT 8
+        """
+    )
+    if isinstance(rows, dict) and rows.get("error"):
+        return []
+    return [str(row.get("category")) for row in rows if row.get("category")]
+
+
+def _fallback_shirt_examples(user_query: str, limit: int = 5) -> list[dict[str, Any]]:
+    """Try lexical matching against shirts when semantic match is empty."""
+    query = _escape_sql_text(user_query)
+    rows = get_data_from_db(
+        f"""
+        SELECT product_id, product_name, description, category, price, stock_qty
+        FROM products
+        WHERE
+          LOWER(COALESCE(product_name, '')) LIKE '%shirt%'
+          OR LOWER(COALESCE(category, '')) LIKE '%shirt%'
+          OR LOWER(COALESCE(description, '')) LIKE '%shirt%'
+        ORDER BY
+          CASE
+            WHEN LOWER(COALESCE(product_name, '')) LIKE '%{query.lower()}%' THEN 0
+            WHEN LOWER(COALESCE(description, '')) LIKE '%{query.lower()}%' THEN 1
+            ELSE 2
+          END,
+          product_id ASC
+        LIMIT {max(1, min(limit, 10))}
+        """
+    )
+    if isinstance(rows, dict) and rows.get("error"):
+        return []
+    return rows
+
+
 def _execute_tool(function_name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Execute supported tool and return serializable response."""
-    if function_name != "get_data_from_db":
-        logger.warning("Unsupported tool requested: %s", function_name)
-        return {"error": f"Unsupported tool: {function_name}"}
+    if function_name == "get_data_from_db":
+        query = args.get("query")
+        if not query:
+            return {"error": "Missing required argument: query"}
+        logger.info("Executing tool get_data_from_db")
+        return {"result": get_data_from_db(query=query)}
 
-    query = args.get("query")
-    if not query:
-        return {"error": "Missing required argument: query"}
+    if function_name == "semantic_search_products":
+        query = args.get("query")
+        if not query:
+            return {"error": "Missing required argument: query"}
+        limit = int(args.get("limit", 5))
+        logger.info("Executing tool semantic_search_products")
+        result = semantic_search_products(query=query, limit=limit)
+        payload: dict[str, Any] = {"result": result}
+        if not result:
+            payload["hints"] = {
+                "available_categories": _fallback_category_hints(),
+                "shirt_examples": _fallback_shirt_examples(query, limit=limit),
+                "retry_tip": "Try style + color + category, e.g. 'minimal white linen shirt for summer'.",
+            }
+        return payload
 
-    logger.info("Executing tool get_data_from_db")
-    return {"result": get_data_from_db(query=query)}
+    if function_name == "reindex_products_semantic":
+        logger.info("Executing tool reindex_products_semantic")
+        return {"result": reindex_products_semantic()}
+
+    logger.warning("Unsupported tool requested: %s", function_name)
+    return {"error": f"Unsupported tool: {function_name}"}
+
+
+def _try_execute_text_tool_call(raw_text: str) -> dict[str, Any] | None:
+    """
+    Some models return a JSON tool-call in plain text instead of tool_calls.
+    Example: {"function":"semantic_search_products","arguments":{...}}
+    """
+    text = (raw_text or "").strip()
+    if not text.startswith("{") or '"function"' not in text:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+    function_name = payload.get("function")
+    args = payload.get("arguments", {})
+    if not isinstance(function_name, str) or not isinstance(args, dict):
+        return None
+
+    logger.info("Executing text-based tool call: %s args=%s", function_name, args)
+    return _execute_tool(function_name, args)
 
 
 def get_response(session_id: str, user_input: str) -> str:
@@ -188,6 +317,22 @@ def get_response(session_id: str, user_input: str) -> str:
         msg = followup.choices[0].message
 
     reply = (msg.content or "").strip()
+
+    # Fallback: if a provider returned tool-call JSON as plain assistant text,
+    # execute it and ask the model to format a final user-facing response.
+    text_tool_result = _try_execute_text_tool_call(reply)
+    if ENABLE_TOOLS and text_tool_result is not None:
+        messages.append({"role": "assistant", "content": reply})
+        messages.append(
+            {
+                "role": "tool",
+                "content": json.dumps(text_tool_result, default=str),
+            }
+        )
+        followup = _completion(messages, use_tools=False)
+        msg = followup.choices[0].message
+        reply = (msg.content or "").strip()
+
     messages.append({"role": "assistant", "content": reply})
     chat_sessions[session_id] = _trim_history(messages)
     logger.info("Response generated for session_id=%s reply_chars=%s", session_id, len(reply))

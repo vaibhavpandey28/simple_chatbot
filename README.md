@@ -134,3 +134,31 @@ curl -X POST "http://127.0.0.1:8000/chat" \
 
 - Never commit real `HF_TOKEN` to git.
 - If token is exposed, rotate it immediately in Hugging Face settings.
+
+
+## Semantic Search Upgrade
+
+This project now supports semantic product search through Qdrant.
+
+### What changed
+
+- New tool: `semantic_search_products(query, limit=5)`
+- New tool: `reindex_products_semantic()`
+- Product vectors are indexed from PostgreSQL `products` table into Qdrant collection `products`
+- DB and Qdrant are now configurable using `.env`
+
+### First-time setup for semantic search
+
+1. Ensure PostgreSQL and Qdrant are running.
+2. Update `.env` with DB and Qdrant variables from `.env-example`.
+3. Install deps: `uv sync`
+4. Start app: `uv run uvicorn main:app --reload`
+5. Ask a product intent query, e.g. `show aesthetic shirts for summer`.
+
+The first semantic query auto-indexes products if the Qdrant collection is empty.
+
+Manual indexing command:
+
+```bash
+uv run python scripts/index_products_qdrant.py --recreate
+```
