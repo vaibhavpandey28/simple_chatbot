@@ -109,6 +109,7 @@ curl -X POST "http://127.0.0.1:8000/chat" \
 - `HF_TEMPERATURE` default: `0.2`
 - `HF_TOP_P` default: `0.9`
 - `MAX_HISTORY_MESSAGES` default: `16`
+- `EPISODIC_TOP_K` default: `3` (how many relevant episodes are injected)
 - `ENABLE_TOOLS` default: `true`
 
 ### Logging
@@ -162,3 +163,12 @@ Manual indexing command:
 ```bash
 uv run python scripts/index_products_qdrant.py --recreate
 ```
+
+## Episodic Memory (LangChain + LangGraph)
+
+- Memory graph uses `langgraph` `StateGraph(MessagesState)` + `MemorySaver` checkpointer.
+- Each completed turn is stored as an episode: timestamp, user input, assistant reply, summary, tags.
+- On each new query, chatbot injects:
+  - recent conversation memory
+  - top relevant episodic memories (`EPISODIC_TOP_K`)
+- SQL self-correction still runs independently for DB-query retries.

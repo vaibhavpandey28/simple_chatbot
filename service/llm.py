@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from openai import BadRequestError, OpenAI
 
 from core.logger import get_logger
+from service.memory import EpisodicMemoryManager
 from service.tools import (
     get_data_from_db,
     reindex_products_semantic,
@@ -28,6 +29,7 @@ ENABLE_TOOLS = os.getenv("ENABLE_TOOLS", "true").strip().lower() in {
     "yes",
     "on",
 }
+EPISODIC_TOP_K = int(os.getenv("EPISODIC_TOP_K", "3"))
 
 
 DEFAULT_SYSTEM_PROMPT = """
@@ -92,6 +94,7 @@ client = OpenAI(
 # Stores chat history in memory: {session_id: [messages...]}
 chat_sessions: dict[str, list[dict[str, str]]] = {}
 _products_columns_cache: list[str] | None = None
+episodic_memory = EpisodicMemoryManager()
 
 
 TOOLS = [
@@ -171,6 +174,30 @@ def _completion(messages: list[dict[str, str]], use_tools: bool):
     if use_tools:
         kwargs["tools"] = TOOLS
     return client.chat.completions.create(**kwargs)
+
+
+def _inject_memory_context(
+    session_id: str, user_input: str, messages: list[dict[str, str]]
+) -> list[dict[str, str]]:
+    """Inject relevant episodic memory as a temporary system message."""
+    memory_context = episodic_memory.build_memory_context(
+        session_id=session_id, query=user_input, top_k=EPISODIC_TOP_K
+    )
+    if not memory_context:
+        return list(messages)
+
+    enriched = list(messages)
+    enriched.append(
+        {
+            "role": "system",
+            "content": (
+                "Use this memory context only when relevant. "
+                "Do not reveal internal memory mechanics.\n"
+                f"{memory_context}"
+            ),
+        }
+    )
+    return enriched
 
 
 def _get_or_create_session(session_id: str) -> list[dict[str, str]]:
@@ -520,6 +547,9 @@ def get_response(session_id: str, user_input: str) -> str:
 
     messages = _get_or_create_session(session_id)
     messages.append({"role": "user", "content": user_input})
+    model_messages = _inject_memory_context(
+        session_id=session_id, user_input=user_input, messages=messages
+    )
     logger.info("User message appended. session_id=%s total_messages=%s", session_id, len(messages))
 
     if ENABLE_TOOLS:
@@ -542,15 +572,18 @@ def get_response(session_id: str, user_input: str) -> str:
                     "content": f"Router context: {json.dumps({'router': route, 'function': 'get_data_from_db', 'tool_result': sql_run['tool_result'], 'sql_self_correction': {'self_corrected': sql_run['self_corrected'], 'attempts': sql_run['attempts']}}, default=str)}",
                 }
             )
+        model_messages = _inject_memory_context(
+            session_id=session_id, user_input=user_input, messages=messages
+        )
 
     try:
         logger.info("Calling model=%s tools_enabled=%s", MODEL_NAME, ENABLE_TOOLS)
-        response = _completion(messages, use_tools=ENABLE_TOOLS)
+        response = _completion(model_messages, use_tools=ENABLE_TOOLS)
     except BadRequestError as exc:
         # Some routed models/providers reject tools support.
         if "does not support tools" in str(exc).lower():
             logger.warning("Model/provider does not support tools. Retrying without tools.")
-            response = _completion(messages, use_tools=False)
+            response = _completion(model_messages, use_tools=False)
         else:
             logger.exception("LLM completion failed for session_id=%s", session_id)
             raise
@@ -611,6 +644,9 @@ def get_response(session_id: str, user_input: str) -> str:
         reply = (msg.content or "").strip()
 
     messages.append({"role": "assistant", "content": reply})
+    episodic_memory.append_turn(
+        session_id=session_id, user_input=user_input, assistant_reply=reply
+    )
     chat_sessions[session_id] = _trim_history(messages)
     logger.info("Response generated for session_id=%s reply_chars=%s", session_id, len(reply))
     return reply
