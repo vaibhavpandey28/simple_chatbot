@@ -65,6 +65,23 @@ Rules:
 - Detect constraints like size/color/under $X/between prices and route to sql.
 """
 
+SQL_SELF_CORRECTION_PROMPT = """
+You are a SQL self-correction layer for a PostgreSQL ecommerce assistant.
+Fix failed SQL queries using the user intent, SQL error, and available schema.
+
+Return ONLY valid JSON:
+{
+  "fixed_sql": "SELECT ...",
+  "reason": "short reason"
+}
+
+Rules:
+- Output only SAFE SELECT SQL.
+- Never use columns outside available_columns.
+- Keep selected columns: product_id, product_name, description, category, price, stock_qty.
+- Preserve user constraints where possible (price/category/stock/etc).
+"""
+
 
 # API client (Hugging Face Router speaks OpenAI-compatible format).
 client = OpenAI(
@@ -310,6 +327,14 @@ def _fallback_sql_for_user_query(user_input: str) -> str:
     """.strip()
 
 
+def _is_safe_select_sql(sql: str) -> bool:
+    text = (sql or "").strip().lower()
+    if not text.startswith("select"):
+        return False
+    banned = ("insert", "update", "delete", "drop", "alter", "truncate")
+    return not any(re.search(rf"\b{kw}\b", text) for kw in banned)
+
+
 def _try_execute_text_tool_call(raw_text: str) -> dict[str, Any] | None:
     """
     Some models return a JSON tool-call in plain text instead of `tool_calls`.
@@ -340,6 +365,97 @@ def _extract_first_json_object(text: str) -> dict[str, Any] | None:
         return json.loads(match.group(0))
     except json.JSONDecodeError:
         return None
+
+
+def _repair_sql_query(
+    user_input: str,
+    failed_sql: str,
+    error_text: str,
+    available_columns: list[str],
+) -> tuple[str | None, str]:
+    """Use LLM to repair SQL after a DB error."""
+    repair_messages = [
+        {"role": "system", "content": SQL_SELF_CORRECTION_PROMPT},
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "user_input": user_input,
+                    "failed_sql": failed_sql,
+                    "error": error_text,
+                    "available_columns": available_columns,
+                }
+            ),
+        },
+    ]
+
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=repair_messages,
+            temperature=0,
+            top_p=1,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        parsed = _extract_first_json_object(raw) or {}
+    except Exception:
+        logger.exception("SQL repair step failed")
+        return None, "repair_call_failed"
+
+    fixed_sql = str(parsed.get("fixed_sql", "")).strip()
+    reason = str(parsed.get("reason", "")).strip() or "no_reason"
+    if not _is_safe_select_sql(fixed_sql):
+        return None, f"unsafe_or_invalid_sql:{reason}"
+    return fixed_sql, reason
+
+
+def _run_sql_with_self_correction(user_input: str, initial_sql: str, max_attempts: int = 3) -> dict[str, Any]:
+    """
+    Self-correction loop:
+    1) Run SQL
+    2) On error, inspect error + schema
+    3) Repair SQL and retry
+    """
+    available_columns = _get_products_columns()
+    sql = initial_sql if _is_safe_select_sql(initial_sql) else _fallback_sql_for_user_query(user_input)
+    attempts: list[dict[str, Any]] = []
+    last_run: dict[str, Any] = {"result": {"error": "No SQL executed"}}
+
+    for attempt in range(1, max_attempts + 1):
+        last_run = _execute_tool("get_data_from_db", {"query": sql})
+        result = last_run.get("result")
+        error_text = result.get("error") if isinstance(result, dict) else None
+
+        attempts.append({"attempt": attempt, "sql": sql, "error": error_text})
+        if not error_text:
+            return {
+                "tool_result": last_run,
+                "final_sql": sql,
+                "attempts": attempts,
+                "self_corrected": attempt > 1,
+            }
+
+        logger.warning("SQL attempt %s failed: %s", attempt, error_text)
+        if attempt == max_attempts:
+            break
+
+        fixed_sql, reason = _repair_sql_query(
+            user_input=user_input,
+            failed_sql=sql,
+            error_text=str(error_text),
+            available_columns=available_columns,
+        )
+        if not fixed_sql:
+            logger.warning("Repair failed (%s). Using baseline fallback SQL.", reason)
+            fixed_sql = _fallback_sql_for_user_query(user_input)
+        sql = fixed_sql
+
+    return {
+        "tool_result": last_run,
+        "final_sql": sql,
+        "attempts": attempts,
+        "self_corrected": len(attempts) > 1,
+    }
 
 
 def _route_user_query(user_input: str) -> dict[str, Any]:
@@ -418,17 +534,14 @@ def get_response(session_id: str, user_input: str) -> str:
             messages.append({"role": "assistant", "content": f"Router context: {json.dumps({'router': route, 'function': 'semantic_search_products', 'tool_result': tool_result}, default=str)}"})
         elif route["route"] == "sql":
             sql_query = route["sql_query"] or _fallback_sql_for_user_query(user_input)
-            tool_result = _execute_tool(
-                "get_data_from_db",
-                {"query": sql_query},
+            sql_run = _run_sql_with_self_correction(user_input=user_input, initial_sql=sql_query, max_attempts=3)
+            route["sql_query"] = sql_run["final_sql"]
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": f"Router context: {json.dumps({'router': route, 'function': 'get_data_from_db', 'tool_result': sql_run['tool_result'], 'sql_self_correction': {'self_corrected': sql_run['self_corrected'], 'attempts': sql_run['attempts']}}, default=str)}",
+                }
             )
-            err = (tool_result.get("result") or {}).get("error") if isinstance(tool_result.get("result"), dict) else None
-            if err and "column" in str(err).lower() and "does not exist" in str(err).lower():
-                logger.warning("Router SQL used missing column. Retrying with safe fallback SQL.")
-                fallback_query = _fallback_sql_for_user_query(user_input)
-                tool_result = _execute_tool("get_data_from_db", {"query": fallback_query})
-                route["sql_query"] = fallback_query
-            messages.append({"role": "assistant", "content": f"Router context: {json.dumps({'router': route, 'function': 'get_data_from_db', 'tool_result': tool_result}, default=str)}"})
 
     try:
         logger.info("Calling model=%s tools_enabled=%s", MODEL_NAME, ENABLE_TOOLS)
