@@ -1,14 +1,17 @@
 # Simple Chatbot
 
-A FastAPI-based chatbot with a custom HTML/CSS/JS UI, powered by Hugging Face Router (OpenAI-compatible API). It supports session memory and optional database tool-calling.
+A FastAPI-based chatbot with a custom HTML/CSS/JS UI, powered by Hugging Face Router (OpenAI-compatible API). It includes routing, tool-calling, SQL self-correction, episodic memory persistence, and Langfuse monitoring.
 
 ## Features
 
 - Web chat UI at `/`
 - REST API endpoint at `/chat`
 - Hugging Face Router integration via OpenAI SDK
-- Per-session in-memory conversation history
-- Optional tool-calling for PostgreSQL queries
+- Routing supervisor (`semantic_search` / `sql` / `direct_answer`)
+- SQL self-correction loop (retry with repaired query)
+- Episodic memory persisted in PostgreSQL
+- Semantic search via Qdrant
+- Langfuse monitoring (optional)
 - Structured, color-capable logging
 
 ## Tech Stack
@@ -27,7 +30,9 @@ simple_chatbot/
 ├─ core/
 │  └─ logger.py                # Central logger config
 ├─ service/
-│  ├─ llm.py                   # HF Router chat + tool flow
+│  ├─ llm.py                   # Router + tool flow + SQL self-correction + memory injection
+│  ├─ memory.py                # Episodic memory manager (PostgreSQL-backed)
+│  ├─ monitoring.py            # Langfuse monitoring wrapper
 │  ├─ tools.py                 # Tool wrappers
 │  └─ db.py                    # PostgreSQL query execution
 ├─ static/
@@ -120,7 +125,10 @@ curl -X POST "http://127.0.0.1:8000/chat" \
 
 ## Tool-Calling Notes
 
-- Current tool: `get_data_from_db(query: str)`
+- Tools:
+  - `get_data_from_db(query: str)`
+  - `semantic_search_products(query: str, limit: int = 5)`
+  - `reindex_products_semantic()`
 - Intended for safe `SELECT` queries
 - Tool output is JSON-serialized with datetime-safe conversion
 - If model/provider does not support tools, app retries without tools
@@ -164,11 +172,47 @@ Manual indexing command:
 uv run python scripts/index_products_qdrant.py --recreate
 ```
 
-## Episodic Memory (LangChain + LangGraph)
+## Episodic Memory
 
-- Memory graph uses `langgraph` `StateGraph(MessagesState)` + `MemorySaver` checkpointer.
-- Each completed turn is stored as an episode: timestamp, user input, assistant reply, summary, tags.
+- Each completed turn is stored as an episode in PostgreSQL:
+  - `episodic_memory` table (summary + tags + full turn)
+  - `chat_messages_memory` table (recent chat messages)
 - On each new query, chatbot injects:
   - recent conversation memory
   - top relevant episodic memories (`EPISODIC_TOP_K`)
-- SQL self-correction still runs independently for DB-query retries.
+- Memory persists across server restarts.
+
+## Langfuse Monitoring
+
+- Enable with `.env`:
+  - `LANGFUSE_ENABLED=true`
+  - `LANGFUSE_PUBLIC_KEY=...`
+  - `LANGFUSE_SECRET_KEY=...`
+  - Optional `LANGFUSE_HOST` (default cloud)
+- Captures trace per chat request and events for:
+  - router decision
+  - semantic search runs
+  - SQL attempts and self-correction
+  - final response/error
+
+## What Is Done
+
+- Routing supervisor for query decision (`semantic_search` / `sql` / `direct_answer`)
+- SQL self-correction loop with retry attempts
+- Schema-aware SQL repair guidance
+- Semantic product search with Qdrant + reindex tool
+- Episodic memory persistence in PostgreSQL
+- Memory context injection into model prompt
+- Langfuse instrumentation hooks for traces/events
+
+## Pending (For Fully Agentic V2)
+
+- Multi-step planning loop (`plan -> act -> observe -> re-plan`)
+- Multi-tool execution chain in a single turn (beyond route-first flow)
+- Completion evaluator/critic before final answer
+- Stronger guardrails (SQL validator/policy gate + risk scoring)
+- Optional human approval checkpoint for risky actions
+- Session persistence in frontend `localStorage` (stable `session_id` across refresh)
+
+
+## Pe

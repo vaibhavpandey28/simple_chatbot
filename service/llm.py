@@ -8,6 +8,7 @@ from openai import BadRequestError, OpenAI
 
 from core.logger import get_logger
 from service.memory import EpisodicMemoryManager
+from service.monitoring import LangfuseMonitor
 from service.tools import (
     get_data_from_db,
     reindex_products_semantic,
@@ -95,6 +96,7 @@ client = OpenAI(
 chat_sessions: dict[str, list[dict[str, str]]] = {}
 _products_columns_cache: list[str] | None = None
 episodic_memory = EpisodicMemoryManager()
+monitor = LangfuseMonitor()
 
 
 TOOLS = [
@@ -436,7 +438,12 @@ def _repair_sql_query(
     return fixed_sql, reason
 
 
-def _run_sql_with_self_correction(user_input: str, initial_sql: str, max_attempts: int = 3) -> dict[str, Any]:
+def _run_sql_with_self_correction(
+    user_input: str,
+    initial_sql: str,
+    max_attempts: int = 3,
+    trace: Any = None,
+) -> dict[str, Any]:
     """
     Self-correction loop:
     1) Run SQL
@@ -454,6 +461,12 @@ def _run_sql_with_self_correction(user_input: str, initial_sql: str, max_attempt
         error_text = result.get("error") if isinstance(result, dict) else None
 
         attempts.append({"attempt": attempt, "sql": sql, "error": error_text})
+        monitor.event(
+            trace,
+            name="sql_attempt",
+            metadata={"attempt": attempt, "sql": sql},
+            output={"error": error_text},
+        )
         if not error_text:
             return {
                 "tool_result": last_run,
@@ -545,6 +558,11 @@ def get_response(session_id: str, user_input: str) -> str:
         logger.error("HF_TOKEN is missing; cannot call Hugging Face Router.")
         return "HF_TOKEN is missing. Add it in .env and restart the server."
 
+    trace = monitor.start_trace(
+        name="chat_request",
+        session_id=session_id,
+        input_payload={"user_input": user_input},
+    )
     messages = _get_or_create_session(session_id)
     messages.append({"role": "user", "content": user_input})
     model_messages = _inject_memory_context(
@@ -555,17 +573,40 @@ def get_response(session_id: str, user_input: str) -> str:
     if ENABLE_TOOLS:
         route = _route_user_query(user_input)
         logger.info("Router selected route=%s reason=%s", route["route"], route.get("reason", ""))
+        monitor.event(
+            trace,
+            name="router_decision",
+            metadata={"route": route.get("route"), "reason": route.get("reason")},
+            output=route,
+        )
 
         if route["route"] == "semantic_search":
             tool_result = _execute_tool(
                 "semantic_search_products",
                 {"query": route["semantic_query"], "limit": 5},
             )
+            monitor.event(
+                trace,
+                name="semantic_search",
+                metadata={"query": route.get("semantic_query"), "limit": 5},
+                output={"result_count": len(tool_result.get("result", [])) if isinstance(tool_result.get("result"), list) else None},
+            )
             messages.append({"role": "assistant", "content": f"Router context: {json.dumps({'router': route, 'function': 'semantic_search_products', 'tool_result': tool_result}, default=str)}"})
         elif route["route"] == "sql":
             sql_query = route["sql_query"] or _fallback_sql_for_user_query(user_input)
-            sql_run = _run_sql_with_self_correction(user_input=user_input, initial_sql=sql_query, max_attempts=3)
+            sql_run = _run_sql_with_self_correction(
+                user_input=user_input,
+                initial_sql=sql_query,
+                max_attempts=3,
+                trace=trace,
+            )
             route["sql_query"] = sql_run["final_sql"]
+            monitor.event(
+                trace,
+                name="sql_final",
+                metadata={"self_corrected": sql_run.get("self_corrected")},
+                output={"attempts": sql_run.get("attempts"), "final_sql": sql_run.get("final_sql")},
+            )
             messages.append(
                 {
                     "role": "assistant",
@@ -586,9 +627,13 @@ def get_response(session_id: str, user_input: str) -> str:
             response = _completion(model_messages, use_tools=False)
         else:
             logger.exception("LLM completion failed for session_id=%s", session_id)
+            monitor.event(trace, name="llm_error", output={"error": str(exc)})
+            monitor.end_trace(trace, output={"error": str(exc)})
             raise
     except Exception:
         logger.exception("LLM completion failed for session_id=%s", session_id)
+        monitor.event(trace, name="llm_error", output={"error": "unexpected_exception"})
+        monitor.end_trace(trace, output={"error": "unexpected_exception"})
         raise
 
     msg = response.choices[0].message
@@ -648,5 +693,10 @@ def get_response(session_id: str, user_input: str) -> str:
         session_id=session_id, user_input=user_input, assistant_reply=reply
     )
     chat_sessions[session_id] = _trim_history(messages)
+    monitor.end_trace(
+        trace,
+        output={"reply": reply},
+        metadata={"reply_chars": len(reply), "tools_enabled": ENABLE_TOOLS},
+    )
     logger.info("Response generated for session_id=%s reply_chars=%s", session_id, len(reply))
     return reply
