@@ -12,6 +12,7 @@ from service.monitoring import LangfuseMonitor
 from service.tools import (
     get_data_from_db,
     reindex_products_semantic,
+    search_market_web,
     semantic_search_products,
 )
 
@@ -41,6 +42,7 @@ You are Vaibhav's personal AI assistant.
 - Do not invent names, stories, or context.
 - If unsure, say so briefly and ask for clarification.
 - For product recommendations, prefer semantic_search_products tool before raw SQL.
+- If local catalog search returns empty or weak results, use search_market_web as fallback.
 - If semantic search returns no matches, provide concrete fallback help:
   include likely categories from the database and suggest 2-3 specific rephrases.
 """
@@ -91,19 +93,22 @@ Given the user_input and current observation, choose exactly one next action.
 
 Return ONLY JSON:
 {
-  "action": "semantic_search" | "sql" | "respond",
+  "action": "semantic_search" | "sql" | "market_search" | "respond",
   "reason": "short reason",
   "semantic_query": "string",
   "sql_query": "SELECT ...",
+  "market_query": "string",
   "response_hint": "string"
 }
 
 Rules:
 - Use semantic_search for broad/fuzzy product discovery.
 - Use sql for exact filters, ranges, stock, pricing constraints.
+- Use market_search when local semantic/sql results are empty or not useful.
 - Use respond only when enough evidence is available.
 - If action != semantic_search then semantic_query can be empty.
 - If action != sql then sql_query can be empty.
+- If action != market_search then market_query can be empty.
 """
 
 CRITIC_SYSTEM_PROMPT = """
@@ -178,7 +183,29 @@ TOOLS = [
                 "required": ["query"],
             },
         },
-    }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_market_web",
+            "description": "Search external ecommerce sites when local catalog has no suitable results.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Product intent to search across allowed market sites.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of matches to return.",
+                        "default": 5,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 
@@ -324,6 +351,14 @@ def _execute_tool(function_name: str, args: dict[str, Any]) -> dict[str, Any]:
     if function_name == "reindex_products_semantic":
         logger.info("Executing tool reindex_products_semantic")
         return {"result": reindex_products_semantic()}
+
+    if function_name == "search_market_web":
+        query = args.get("query")
+        if not query:
+            return {"error": "Missing required argument: query"}
+        limit = int(args.get("limit", 5))
+        logger.info("Executing tool search_market_web")
+        return {"result": search_market_web(query=query, limit=limit)}
 
     logger.warning("Unsupported tool requested: %s", function_name)
     return {"error": f"Unsupported tool: {function_name}"}
@@ -609,6 +644,29 @@ def _route_user_query(user_input: str) -> dict[str, Any]:
     }
 
 
+def _prefer_market_fallback(last_observation: dict[str, Any], step: int) -> bool:
+    if step <= 1:
+        return False
+    status = str(last_observation.get("status", ""))
+    if status not in {"semantic_done", "sql_done"}:
+        return False
+    result_count = int(last_observation.get("result_count", 0))
+    return result_count == 0
+
+
+def _planner_or_fallback_action(user_input: str, observation: dict[str, Any], step: int) -> dict[str, Any]:
+    if _prefer_market_fallback(observation, step):
+        return {
+            "action": "market_search",
+            "reason": "local_results_empty_use_market_fallback",
+            "semantic_query": "",
+            "sql_query": "",
+            "market_query": user_input,
+            "response_hint": "",
+        }
+    return _planner_next_action(user_input=user_input, observation=observation, step=step)
+
+
 def _planner_next_action(user_input: str, observation: dict[str, Any], step: int) -> dict[str, Any]:
     available_columns = ", ".join(_get_products_columns())
     planner_messages = [
@@ -649,17 +707,19 @@ def _planner_next_action(user_input: str, observation: dict[str, Any], step: int
             "reason": route.get("reason", "fallback_route"),
             "semantic_query": route.get("semantic_query", user_input),
             "sql_query": route.get("sql_query", ""),
+            "market_query": "",
             "response_hint": "",
         }
 
     action = str(parsed.get("action", "")).strip().lower()
-    if action not in {"semantic_search", "sql", "respond"}:
+    if action not in {"semantic_search", "sql", "market_search", "respond"}:
         action = "respond" if step > 1 else "semantic_search"
     return {
         "action": action,
         "reason": str(parsed.get("reason", "")).strip(),
         "semantic_query": str(parsed.get("semantic_query", user_input)).strip() or user_input,
         "sql_query": str(parsed.get("sql_query", "")).strip(),
+        "market_query": str(parsed.get("market_query", user_input)).strip() or user_input,
         "response_hint": str(parsed.get("response_hint", "")).strip(),
     }
 
@@ -668,7 +728,7 @@ def _run_agentic_loop(user_input: str, trace: Any = None, max_steps: int = 3) ->
     steps: list[dict[str, Any]] = []
     observation: dict[str, Any] = {"status": "start"}
     for step in range(1, max_steps + 1):
-        plan = _planner_next_action(user_input=user_input, observation=observation, step=step)
+        plan = _planner_or_fallback_action(user_input=user_input, observation=observation, step=step)
         action = plan["action"]
         step_payload: dict[str, Any] = {"step": step, "plan": plan}
 
@@ -680,8 +740,18 @@ def _run_agentic_loop(user_input: str, trace: Any = None, max_steps: int = 3) ->
 
         if action == "semantic_search":
             tool_result = _execute_tool("semantic_search_products", {"query": plan["semantic_query"], "limit": 5})
-            observation = {"status": "semantic_done", "result_count": len(tool_result.get("result", [])) if isinstance(tool_result.get("result"), list) else 0}
+            semantic_count = len(tool_result.get("result", [])) if isinstance(tool_result.get("result"), list) else 0
+            observation = {"status": "semantic_done", "result_count": semantic_count}
             step_payload["tool"] = {"function": "semantic_search_products", "result": tool_result}
+            steps.append(step_payload)
+            monitor.event(trace, name="agent_step", metadata={"step": step, "action": action}, output=observation)
+            continue
+
+        if action == "market_search":
+            tool_result = _execute_tool("search_market_web", {"query": plan["market_query"], "limit": 5})
+            market_count = len(tool_result.get("result", [])) if isinstance(tool_result.get("result"), list) else 0
+            observation = {"status": "market_done", "result_count": market_count}
+            step_payload["tool"] = {"function": "search_market_web", "result": tool_result}
             steps.append(step_payload)
             monitor.event(trace, name="agent_step", metadata={"step": step, "action": action}, output=observation)
             continue
@@ -700,6 +770,11 @@ def _run_agentic_loop(user_input: str, trace: Any = None, max_steps: int = 3) ->
             "status": "sql_done",
             "self_corrected": sql_run.get("self_corrected"),
             "risk": policy["risk"],
+            "result_count": (
+                len(sql_run["tool_result"].get("result", []))
+                if isinstance(sql_run["tool_result"].get("result"), list)
+                else 0
+            ),
         }
         step_payload["tool"] = {
             "function": "get_data_from_db",
