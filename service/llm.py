@@ -85,6 +85,35 @@ Rules:
 - Preserve user constraints where possible (price/category/stock/etc).
 """
 
+PLANNER_SYSTEM_PROMPT = """
+You are an execution planner in a plan-act-observe-replan loop.
+Given the user_input and current observation, choose exactly one next action.
+
+Return ONLY JSON:
+{
+  "action": "semantic_search" | "sql" | "respond",
+  "reason": "short reason",
+  "semantic_query": "string",
+  "sql_query": "SELECT ...",
+  "response_hint": "string"
+}
+
+Rules:
+- Use semantic_search for broad/fuzzy product discovery.
+- Use sql for exact filters, ranges, stock, pricing constraints.
+- Use respond only when enough evidence is available.
+- If action != semantic_search then semantic_query can be empty.
+- If action != sql then sql_query can be empty.
+"""
+
+CRITIC_SYSTEM_PROMPT = """
+You are a completion critic.
+Check whether the draft answer fully addresses the user query and matches tool observations.
+If good, return {"needs_revision": false, "improved_answer": ""}.
+If weak/incomplete, return {"needs_revision": true, "improved_answer": "...better final answer..."}.
+Return ONLY JSON.
+"""
+
 
 # API client (Hugging Face Router speaks OpenAI-compatible format).
 client = OpenAI(
@@ -364,6 +393,34 @@ def _is_safe_select_sql(sql: str) -> bool:
     return not any(re.search(rf"\b{kw}\b", text) for kw in banned)
 
 
+def _assess_sql_risk(sql: str) -> dict[str, Any]:
+    text = (sql or "").strip().lower()
+    risk_score = 0
+    reasons: list[str] = []
+    if not text.startswith("select"):
+        risk_score += 90
+        reasons.append("not_select")
+    if " from products " not in f" {text} ":
+        risk_score += 30
+        reasons.append("non_products_table")
+    if any(kw in text for kw in [" join ", " union ", ";", "--", " pg_", " information_schema"]):
+        risk_score += 40
+        reasons.append("suspicious_pattern")
+    if " limit " not in f" {text} ":
+        risk_score += 20
+        reasons.append("missing_limit")
+    return {"risk_score": min(100, risk_score), "reasons": reasons}
+
+
+def _guard_sql_policy(sql: str) -> dict[str, Any]:
+    risk = _assess_sql_risk(sql)
+    if not _is_safe_select_sql(sql):
+        return {"allowed": False, "risk": risk, "blocked_reason": "unsafe_sql"}
+    if risk["risk_score"] >= 70:
+        return {"allowed": False, "risk": risk, "blocked_reason": "high_risk_sql"}
+    return {"allowed": True, "risk": risk, "blocked_reason": ""}
+
+
 def _try_execute_text_tool_call(raw_text: str) -> dict[str, Any] | None:
     """
     Some models return a JSON tool-call in plain text instead of `tool_calls`.
@@ -552,6 +609,144 @@ def _route_user_query(user_input: str) -> dict[str, Any]:
     }
 
 
+def _planner_next_action(user_input: str, observation: dict[str, Any], step: int) -> dict[str, Any]:
+    available_columns = ", ".join(_get_products_columns())
+    planner_messages = [
+        {
+            "role": "system",
+            "content": (
+                f"{PLANNER_SYSTEM_PROMPT}\n"
+                f"Available products columns: {available_columns}\n"
+                "Prefer safe SQL with LIMIT."
+            ),
+        },
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "step": step,
+                    "user_input": user_input,
+                    "observation": observation,
+                },
+                default=str,
+            ),
+        },
+    ]
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=planner_messages,
+            temperature=0,
+            top_p=1,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        parsed = _extract_first_json_object(raw) or {}
+    except Exception:
+        logger.exception("Planner step failed; fallback to route planner.")
+        route = _route_user_query(user_input)
+        return {
+            "action": "sql" if route["route"] == "sql" else ("semantic_search" if route["route"] == "semantic_search" else "respond"),
+            "reason": route.get("reason", "fallback_route"),
+            "semantic_query": route.get("semantic_query", user_input),
+            "sql_query": route.get("sql_query", ""),
+            "response_hint": "",
+        }
+
+    action = str(parsed.get("action", "")).strip().lower()
+    if action not in {"semantic_search", "sql", "respond"}:
+        action = "respond" if step > 1 else "semantic_search"
+    return {
+        "action": action,
+        "reason": str(parsed.get("reason", "")).strip(),
+        "semantic_query": str(parsed.get("semantic_query", user_input)).strip() or user_input,
+        "sql_query": str(parsed.get("sql_query", "")).strip(),
+        "response_hint": str(parsed.get("response_hint", "")).strip(),
+    }
+
+
+def _run_agentic_loop(user_input: str, trace: Any = None, max_steps: int = 3) -> list[dict[str, Any]]:
+    steps: list[dict[str, Any]] = []
+    observation: dict[str, Any] = {"status": "start"}
+    for step in range(1, max_steps + 1):
+        plan = _planner_next_action(user_input=user_input, observation=observation, step=step)
+        action = plan["action"]
+        step_payload: dict[str, Any] = {"step": step, "plan": plan}
+
+        if action == "respond":
+            step_payload["observation"] = {"status": "enough_context"}
+            steps.append(step_payload)
+            monitor.event(trace, name="agent_step", metadata={"step": step, "action": action}, output=step_payload)
+            break
+
+        if action == "semantic_search":
+            tool_result = _execute_tool("semantic_search_products", {"query": plan["semantic_query"], "limit": 5})
+            observation = {"status": "semantic_done", "result_count": len(tool_result.get("result", [])) if isinstance(tool_result.get("result"), list) else 0}
+            step_payload["tool"] = {"function": "semantic_search_products", "result": tool_result}
+            steps.append(step_payload)
+            monitor.event(trace, name="agent_step", metadata={"step": step, "action": action}, output=observation)
+            continue
+
+        sql_query = plan["sql_query"] or _fallback_sql_for_user_query(user_input)
+        policy = _guard_sql_policy(sql_query)
+        if not policy["allowed"]:
+            sql_query = _fallback_sql_for_user_query(user_input)
+        sql_run = _run_sql_with_self_correction(
+            user_input=user_input,
+            initial_sql=sql_query,
+            max_attempts=3,
+            trace=trace,
+        )
+        observation = {
+            "status": "sql_done",
+            "self_corrected": sql_run.get("self_corrected"),
+            "risk": policy["risk"],
+        }
+        step_payload["tool"] = {
+            "function": "get_data_from_db",
+            "policy": policy,
+            "result": sql_run["tool_result"],
+            "attempts": sql_run["attempts"],
+            "final_sql": sql_run["final_sql"],
+        }
+        steps.append(step_payload)
+        monitor.event(trace, name="agent_step", metadata={"step": step, "action": action}, output=observation)
+    return steps
+
+
+def _critic_revise_answer(user_input: str, draft_reply: str, execution_steps: list[dict[str, Any]]) -> str:
+    critic_messages = [
+        {"role": "system", "content": CRITIC_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "user_input": user_input,
+                    "draft_reply": draft_reply,
+                    "execution_steps": execution_steps,
+                },
+                default=str,
+            ),
+        },
+    ]
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=critic_messages,
+            temperature=0,
+            top_p=1,
+        )
+        parsed = _extract_first_json_object((resp.choices[0].message.content or "").strip()) or {}
+    except Exception:
+        logger.exception("Critic pass failed; using draft reply.")
+        return draft_reply
+
+    needs_revision = bool(parsed.get("needs_revision", False))
+    improved = str(parsed.get("improved_answer", "")).strip()
+    if needs_revision and improved:
+        return improved
+    return draft_reply
+
+
 def get_response(session_id: str, user_input: str) -> str:
     """Main flow: user message -> router -> optional tool -> final reply."""
     if not HF_TOKEN:
@@ -570,52 +765,16 @@ def get_response(session_id: str, user_input: str) -> str:
     )
     logger.info("User message appended. session_id=%s total_messages=%s", session_id, len(messages))
 
+    execution_steps: list[dict[str, Any]] = []
     if ENABLE_TOOLS:
-        route = _route_user_query(user_input)
-        logger.info("Router selected route=%s reason=%s", route["route"], route.get("reason", ""))
-        monitor.event(
-            trace,
-            name="router_decision",
-            metadata={"route": route.get("route"), "reason": route.get("reason")},
-            output=route,
+        execution_steps = _run_agentic_loop(user_input=user_input, trace=trace, max_steps=3)
+        messages.append(
+            {
+                "role": "assistant",
+                "content": f"Execution context: {json.dumps({'steps': execution_steps}, default=str)}",
+            }
         )
-
-        if route["route"] == "semantic_search":
-            tool_result = _execute_tool(
-                "semantic_search_products",
-                {"query": route["semantic_query"], "limit": 5},
-            )
-            monitor.event(
-                trace,
-                name="semantic_search",
-                metadata={"query": route.get("semantic_query"), "limit": 5},
-                output={"result_count": len(tool_result.get("result", [])) if isinstance(tool_result.get("result"), list) else None},
-            )
-            messages.append({"role": "assistant", "content": f"Router context: {json.dumps({'router': route, 'function': 'semantic_search_products', 'tool_result': tool_result}, default=str)}"})
-        elif route["route"] == "sql":
-            sql_query = route["sql_query"] or _fallback_sql_for_user_query(user_input)
-            sql_run = _run_sql_with_self_correction(
-                user_input=user_input,
-                initial_sql=sql_query,
-                max_attempts=3,
-                trace=trace,
-            )
-            route["sql_query"] = sql_run["final_sql"]
-            monitor.event(
-                trace,
-                name="sql_final",
-                metadata={"self_corrected": sql_run.get("self_corrected")},
-                output={"attempts": sql_run.get("attempts"), "final_sql": sql_run.get("final_sql")},
-            )
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": f"Router context: {json.dumps({'router': route, 'function': 'get_data_from_db', 'tool_result': sql_run['tool_result'], 'sql_self_correction': {'self_corrected': sql_run['self_corrected'], 'attempts': sql_run['attempts']}}, default=str)}",
-                }
-            )
-        model_messages = _inject_memory_context(
-            session_id=session_id, user_input=user_input, messages=messages
-        )
+        model_messages = _inject_memory_context(session_id=session_id, user_input=user_input, messages=messages)
 
     try:
         logger.info("Calling model=%s tools_enabled=%s", MODEL_NAME, ENABLE_TOOLS)
@@ -688,6 +847,7 @@ def get_response(session_id: str, user_input: str) -> str:
         msg = followup.choices[0].message
         reply = (msg.content or "").strip()
 
+    reply = _critic_revise_answer(user_input=user_input, draft_reply=reply, execution_steps=execution_steps)
     messages.append({"role": "assistant", "content": reply})
     episodic_memory.append_turn(
         session_id=session_id, user_input=user_input, assistant_reply=reply

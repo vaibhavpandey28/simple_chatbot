@@ -204,15 +204,12 @@ uv run python scripts/index_products_qdrant.py --recreate
 - Episodic memory persistence in PostgreSQL
 - Memory context injection into model prompt
 - Langfuse instrumentation hooks for traces/events
+- Multi-step execution loop (`plan -> act -> observe -> re-plan`)
+- Multi-tool chaining in a single turn (step-wise loop)
+- Completion critic pass before final answer
+- SQL policy guardrails with risk scoring and fallback
 
 ## Pending (For Fully Agentic V2)
 
-- Multi-step planning loop (`plan -> act -> observe -> re-plan`)
-- Multi-tool execution chain in a single turn (beyond route-first flow)
-- Completion evaluator/critic before final answer
-- Stronger guardrails (SQL validator/policy gate + risk scoring)
 - Optional human approval checkpoint for risky actions
 - Session persistence in frontend `localStorage` (stable `session_id` across refresh)
-
-
-## Pe
