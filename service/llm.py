@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Any
 
 from dotenv import load_dotenv
@@ -41,6 +42,29 @@ You are Vaibhav's personal AI assistant.
   include likely categories from the database and suggest 2-3 specific rephrases.
 """
 
+ROUTER_SYSTEM_PROMPT = """
+You are a routing supervisor for an ecommerce assistant.
+Select exactly one route for the user query:
+- semantic_search: Use for fuzzy discovery, style/taste intent, broad recommendations.
+- sql: Use for explicit structured constraints such as size, color, price limits/ranges, stock checks, exact category filters.
+- direct_answer: Use for non-product chat or when no tool is needed.
+
+Return ONLY valid JSON with shape:
+{
+  "route": "semantic_search" | "sql" | "direct_answer",
+  "reason": "short reason",
+  "semantic_query": "string",
+  "sql_query": "SELECT ..." 
+}
+
+Rules:
+- If route != semantic_search, semantic_query can be empty string.
+- If route != sql, sql_query can be empty string.
+- For sql route, output a SAFE SELECT query only (never INSERT/UPDATE/DELETE/DROP).
+- For product lookups, prefer selecting: product_id, product_name, description, category, price, stock_qty.
+- Detect constraints like size/color/under $X/between prices and route to sql.
+"""
+
 
 # API client (Hugging Face Router speaks OpenAI-compatible format).
 client = OpenAI(
@@ -50,6 +74,7 @@ client = OpenAI(
 
 # Stores chat history in memory: {session_id: [messages...]}
 chat_sessions: dict[str, list[dict[str, str]]] = {}
+_products_columns_cache: list[str] | None = None
 
 
 TOOLS = [
@@ -229,6 +254,62 @@ def _execute_tool(function_name: str, args: dict[str, Any]) -> dict[str, Any]:
     return {"error": f"Unsupported tool: {function_name}"}
 
 
+def _get_products_columns() -> list[str]:
+    """Read products table columns once and cache them for router guidance."""
+    global _products_columns_cache
+    if _products_columns_cache is not None:
+        return _products_columns_cache
+
+    rows = get_data_from_db(
+        """
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'products'
+        ORDER BY ordinal_position
+        """
+    )
+    if isinstance(rows, dict) and rows.get("error"):
+        logger.warning("Could not fetch products columns: %s", rows["error"])
+        _products_columns_cache = [
+            "product_id",
+            "product_name",
+            "description",
+            "category",
+            "price",
+            "stock_qty",
+        ]
+        return _products_columns_cache
+
+    _products_columns_cache = [
+        str(row.get("column_name")) for row in rows if row.get("column_name")
+    ]
+    if not _products_columns_cache:
+        _products_columns_cache = [
+            "product_id",
+            "product_name",
+            "description",
+            "category",
+            "price",
+            "stock_qty",
+        ]
+    return _products_columns_cache
+
+
+def _fallback_sql_for_user_query(user_input: str) -> str:
+    """Generate a guaranteed-safe SQL fallback that only uses known baseline columns."""
+    safe_q = _escape_sql_text(user_input.lower())
+    return f"""
+    SELECT product_id, product_name, description, category, price, stock_qty
+    FROM products
+    WHERE
+      LOWER(COALESCE(product_name, '')) LIKE '%{safe_q}%'
+      OR LOWER(COALESCE(description, '')) LIKE '%{safe_q}%'
+      OR LOWER(COALESCE(category, '')) LIKE '%{safe_q}%'
+    ORDER BY price ASC, product_id ASC
+    LIMIT 10
+    """.strip()
+
+
 def _try_execute_text_tool_call(raw_text: str) -> dict[str, Any] | None:
     """
     Some models return a JSON tool-call in plain text instead of `tool_calls`.
@@ -251,8 +332,72 @@ def _try_execute_text_tool_call(raw_text: str) -> dict[str, Any] | None:
     return _execute_tool(function_name, args)
 
 
+def _extract_first_json_object(text: str) -> dict[str, Any] | None:
+    match = re.search(r"\{[\s\S]*\}", text or "")
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def _route_user_query(user_input: str) -> dict[str, Any]:
+    """Supervisor step that routes user intent to semantic search, SQL, or direct answer."""
+    lowered = user_input.lower()
+    has_structured_filters = any(
+        token in lowered
+        for token in ["size", "under", "below", "less than", "price", "stock", "in stock", "between", "color"]
+    )
+
+    available_columns = ", ".join(_get_products_columns())
+    router_messages = [
+        {
+            "role": "system",
+            "content": (
+                f"{ROUTER_SYSTEM_PROMPT}\n"
+                f"Available products columns: {available_columns}\n"
+                "Never reference columns not present in this list."
+            ),
+        },
+        {"role": "user", "content": user_input},
+    ]
+
+    try:
+        route_resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=router_messages,
+            temperature=0,
+            top_p=1,
+        )
+        raw = (route_resp.choices[0].message.content or "").strip()
+        parsed = _extract_first_json_object(raw) or {}
+    except Exception:
+        logger.exception("Router step failed, falling back to heuristic route")
+        parsed = {}
+
+    route = str(parsed.get("route", "")).strip().lower()
+    semantic_query = str(parsed.get("semantic_query", user_input)).strip() or user_input
+    sql_query = str(parsed.get("sql_query", "")).strip()
+    reason = str(parsed.get("reason", "")).strip()
+
+    if route not in {"semantic_search", "sql", "direct_answer"}:
+        route = "sql" if has_structured_filters else "semantic_search"
+
+    if route == "sql":
+        if not sql_query or not sql_query.lower().startswith("select"):
+            sql_query = _fallback_sql_for_user_query(user_input)
+
+    return {
+        "route": route,
+        "reason": reason,
+        "semantic_query": semantic_query,
+        "sql_query": sql_query,
+    }
+
+
 def get_response(session_id: str, user_input: str) -> str:
-    """Main flow: user message -> model -> optional tool -> final reply."""
+    """Main flow: user message -> router -> optional tool -> final reply."""
     if not HF_TOKEN:
         logger.error("HF_TOKEN is missing; cannot call Hugging Face Router.")
         return "HF_TOKEN is missing. Add it in .env and restart the server."
@@ -260,6 +405,30 @@ def get_response(session_id: str, user_input: str) -> str:
     messages = _get_or_create_session(session_id)
     messages.append({"role": "user", "content": user_input})
     logger.info("User message appended. session_id=%s total_messages=%s", session_id, len(messages))
+
+    if ENABLE_TOOLS:
+        route = _route_user_query(user_input)
+        logger.info("Router selected route=%s reason=%s", route["route"], route.get("reason", ""))
+
+        if route["route"] == "semantic_search":
+            tool_result = _execute_tool(
+                "semantic_search_products",
+                {"query": route["semantic_query"], "limit": 5},
+            )
+            messages.append({"role": "assistant", "content": f"Router context: {json.dumps({'router': route, 'function': 'semantic_search_products', 'tool_result': tool_result}, default=str)}"})
+        elif route["route"] == "sql":
+            sql_query = route["sql_query"] or _fallback_sql_for_user_query(user_input)
+            tool_result = _execute_tool(
+                "get_data_from_db",
+                {"query": sql_query},
+            )
+            err = (tool_result.get("result") or {}).get("error") if isinstance(tool_result.get("result"), dict) else None
+            if err and "column" in str(err).lower() and "does not exist" in str(err).lower():
+                logger.warning("Router SQL used missing column. Retrying with safe fallback SQL.")
+                fallback_query = _fallback_sql_for_user_query(user_input)
+                tool_result = _execute_tool("get_data_from_db", {"query": fallback_query})
+                route["sql_query"] = fallback_query
+            messages.append({"role": "assistant", "content": f"Router context: {json.dumps({'router': route, 'function': 'get_data_from_db', 'tool_result': tool_result}, default=str)}"})
 
     try:
         logger.info("Calling model=%s tools_enabled=%s", MODEL_NAME, ENABLE_TOOLS)
@@ -323,12 +492,7 @@ def get_response(session_id: str, user_input: str) -> str:
     text_tool_result = _try_execute_text_tool_call(reply)
     if ENABLE_TOOLS and text_tool_result is not None:
         messages.append({"role": "assistant", "content": reply})
-        messages.append(
-            {
-                "role": "tool",
-                "content": json.dumps(text_tool_result, default=str),
-            }
-        )
+        messages.append({"role": "assistant", "content": f"Executed text tool call result: {json.dumps(text_tool_result, default=str)}"})
         followup = _completion(messages, use_tools=False)
         msg = followup.choices[0].message
         reply = (msg.content or "").strip()
